@@ -1,0 +1,413 @@
+import capytaine as cpt
+import numpy as np
+import matplotlib.pyplot as plt
+from capytaine.meshes.geometry import Axis
+
+SF = 13.5  # scaling factor to inches-ish (your convention)
+SF_m = 13.5 * 0.01 * 2.54  # scaling factor to meters (your convention)
+
+
+class PlaningHull:
+    def __init__(self, file, num_points, stations, beam, Lf, La, mass):
+        self.pts = np.loadtxt(file, delimiter=",", ndmin=2, dtype=float) * beam / SF
+        self.n = num_points
+        self.st = stations
+        self.mass = mass
+
+        # geometry (in inches-like input, but you scale throughout)
+        self.geo = {"b": beam, "Lf": Lf, "La": La}
+
+        # state dict
+        self.state = {
+            "tau": 6,   # trim in deg
+            "z": 2,     # waterline in cm (your convention)
+            "v": 5,     # signed speed in m/s  (+ forward, - reverse)
+            "m": mass,  # waterload in kg (target supported mass)
+        }
+
+        # Build hull mesh once
+        self.make_mesh(
+            origin=np.array([0, 0, 0.6 * beam / SF]),
+            end=np.array([(Lf + La) / SF, 0, 1.1 * beam / SF]),
+        )
+
+        # Optional foil support
+        self.foil_mesh = None
+        self.foil_pose = {
+            "translate": np.array([0.0, 0.0, 0.0], dtype=float),  # in same mesh units as hull
+            "rotate_axis": Axis((0, 1, 0), (0, 0, 0)),            # default pitch axis
+            "rotate_deg": 0.0
+        }
+        self.ifoil = None  # immersed foil part
+
+        self.debug = True
+
+    # ----------------------------
+    # Mesh construction (hull)
+    # ----------------------------
+    def make_station(self, yz_block, x_val):
+        base = np.column_stack((np.full(len(yz_block), x_val), yz_block))  # (x, y, z)
+        base = base[base[:, 2].argsort()]
+        mirror = base.copy()
+        mirror[:, 1] *= -1  # flip y
+        return np.vstack((base, mirror[::-1]))
+
+    def make_mesh(self, origin, end):
+        n = self.n * 2
+        i = np.arange(1, n + 1)
+
+        pts1 = self.make_station(self.pts[: self.n, :2], self.st[0])
+        f = np.column_stack((np.zeros((n, 2), int), i, (i % n) + 1))
+        self.mesh = cpt.Mesh(vertices=np.vstack((origin, pts1)), faces=f)
+
+        i = np.arange(0, n)
+        f = np.column_stack((i, (i % n) + 1, (i % n) + 1 + n, i + n))
+
+        for l in range(1, len(self.st)):
+            pts2 = self.make_station(self.pts[self.n * l : self.n * (l + 1), :2], self.st[l])
+            self.mesh += cpt.Mesh(vertices=np.vstack((pts1, pts2)), faces=f)
+            pts1 = pts2
+
+        f = np.column_stack((np.zeros((n, 2), int), i, (i % n) + 1))
+        self.mesh += cpt.Mesh(vertices=np.vstack((end, pts1)), faces=f)
+
+    # ----------------------------
+    # Flow direction helpers (SIGNED v)
+    # ----------------------------
+    def get_flow_velocity_vector(self):
+        # signed forward speed (world frame)
+        v = float(self.state["v"])
+        return np.array([v, 0.0, 0.0], dtype=float)
+
+    def get_unit_flow_direction(self):
+        U = self.get_flow_velocity_vector()
+        Umag = float(np.linalg.norm(U))
+        if Umag < 1e-12:
+            return U, np.zeros(3)
+        return U, U / Umag
+
+    def resistance_along_motion(self, F_total):
+        # Positive scalar resistance opposing motion
+        U, uhat = self.get_unit_flow_direction()
+        if np.linalg.norm(uhat) < 1e-12:
+            return 0.0
+        return -float(np.dot(F_total, uhat))
+
+    # ----------------------------
+    # Immersion (hull)
+    # ----------------------------
+    def immerse_hull(self):
+        rp = self.geo["Lf"] / SF
+        tau = np.deg2rad(self.state["tau"])
+        z = self.state["z"] / (SF * 2.54)  # your internal scaling
+
+        body = cpt.FloatingBody(mesh=self.mesh.copy())
+        body.mesh.rotate(axis=Axis((0, 1, 0), (rp, 0, 0)), angle=tau, inplace=True)
+        body.mesh.translate([0, 0, -z], inplace=True)
+
+        self.ibody = body.immersed_part()
+        self.ibody_f = self.ibody.copy().clip(cpt.Plane(normal=(1, 0, 0), point=(rp, 0, 0)))
+
+    # ----------------------------
+    # Wetted geometry
+    # ----------------------------
+    def get_wetted_length(self):
+        vs = self.ibody_f.mesh.vertices
+        wl = (vs.max(axis=0) - vs.min(axis=0))[0] * 0.34
+        return wl
+
+    def get_wetted_areas(self, part="total"):
+        m = self.ibody.mesh if part == "total" else self.ibody_f.mesh
+        A = m.faces_areas
+        N = m.faces_normals
+        sc = (self.geo["b"] * 0.01 * 2.54) ** 2
+
+        area_xy = float(np.sum(np.abs(N[:, 2]) * A)) * sc
+        area_xz = float(np.sum(np.abs(N[:, 0]) * A)) * sc
+        area_yz = float(np.sum(np.abs(N[:, 1]) * A)) * sc
+        area_total = float(np.sum(A)) * sc
+        return [area_xy, area_yz, area_xz, area_total]
+
+    # ----------------------------
+    # Hydrostatics
+    # ----------------------------
+    def get_buoyancy(self):
+        fb = float(self.ibody.disp_mass(rho=1025) * (SF_m) ** 3)
+        cb = float(self.ibody.center_of_buoyancy[0] * SF_m)
+        return fb, cb
+
+    # ----------------------------
+    # Your planing model (kept as-is)
+    # NOTE: it returns scalars, not vectors.
+    # ----------------------------
+    def get_hydrodynamic_forces(self):
+        b = self.geo["b"] * 0.01 * 2.54
+        v = abs(float(self.state["v"]))  # model uses speed magnitude
+        tau = self.state["tau"]
+
+        if v < (0.6 * (9.8 * b) ** 0.5):
+            return 0.0, 0.0
+
+        wl = self.get_wetted_length()
+        area = self.get_wetted_areas("first")[0]
+        Cl0 = tau ** 1.1 * 0.0120 * (wl / b) ** 0.5
+        Cl = Cl0 - 0.0065 * 20 * Cl0 ** 0.6
+        hl = 0.5 * 1025 * Cl * v**2 * area
+
+        vl = hl * np.tan(tau * np.pi / 180)
+
+        if v < (1.1 * (9.8 * b) ** 0.5):
+            return 0.5 * hl, 0.5 * vl
+        if v < (2.1 * (9.8 * b) ** 0.5):
+            return 0.8 * hl, 0.8 * vl
+
+        return hl, vl
+
+    def get_total_lift(self):
+        return self.get_hydrodynamic_forces()[0] + self.get_buoyancy()[0]
+
+    # ----------------------------
+    # NEW: Per-face viscous friction force vector on any mesh
+    # ----------------------------
+    @staticmethod
+    def _friction_force_vector_on_mesh(mesh, U_vec, rho=1025.0, nu=1.19e-6, Lc=0.2, Cf_scale=1.0):
+        """
+        Computes viscous skin-friction force VECTOR by summing over faces.
+
+        mesh: cpt.Mesh (already immersed / wetted part ideally)
+        U_vec: np.array([Ux,Uy,Uz]) signed relative flow velocity in world frame
+        Lc: characteristic length (foil chord or representative length)
+        """
+        Umag = float(np.linalg.norm(U_vec))
+        if Umag < 1e-12:
+            return np.zeros(3)
+
+        uhat = U_vec / Umag
+
+        A = mesh.faces_areas              # (Nf,)
+        N = mesh.faces_normals            # (Nf,3) unit normals
+
+        # Tangential flow direction on each face: project uhat onto face plane
+        proj = uhat - (N @ uhat)[:, None] * N
+        proj_norm = np.linalg.norm(proj, axis=1)
+
+        t_hat = np.zeros_like(proj)
+        mask = proj_norm > 1e-12
+        t_hat[mask] = proj[mask] / proj_norm[mask, None]
+
+        # Reynolds number and Cf
+        Re = Umag * float(Lc) / float(nu)
+        if Re > 100.0:
+            Cf = 0.075 / (np.log10(Re) - 2.0) ** 2
+        else:
+            Cf = 0.0
+        Cf *= float(Cf_scale)
+
+        q = 0.5 * rho * Umag**2
+        dFmag = q * Cf * A                         # (Nf,)
+        F_faces = -dFmag[:, None] * t_hat          # (Nf,3)
+        return F_faces.sum(axis=0)
+
+    # ----------------------------
+    # Hull viscous resistance vector (immersed hull mesh)
+    # ----------------------------
+    def get_hull_viscous_force_vector(self, Lc=None, Cf_scale=0.12):
+        """
+        Vector sum of viscous friction forces on hull immersed surface.
+        Cf_scale keeps your old 0.12 factor behavior.
+        """
+        if not hasattr(self, "ibody"):
+            raise RuntimeError("Call immerse_hull() first (or get_rough_waterline()).")
+
+        # Use a length scale; wetted length is a decent pick
+        if Lc is None:
+            Lc = max(self.get_wetted_length() * SF_m, 1e-3)  # convert-ish; protect zero
+
+        U = self.get_flow_velocity_vector()
+        F = self._friction_force_vector_on_mesh(self.ibody.mesh, U, Lc=Lc, Cf_scale=Cf_scale)
+
+        # Your hull mesh is scaled; you already scale areas elsewhere.
+        # If your mesh faces_areas are not in meters^2, you must scale forces too.
+        # Here we apply same area scaling you used:
+        sc = (self.geo["b"] * 0.01 * 2.54) ** 2
+        return F * sc
+
+    # ----------------------------
+    # OPTIONAL FOIL SUPPORT
+    # ----------------------------
+    def attach_foil_mesh(self, foil_mesh, translate_xyz=(0, 0, 0), rotate_about_xyz=(0, 0, 0), rotate_deg=0.0):
+        """
+        Attach a foil mesh (cpt.Mesh). You can place it relative to hull.
+        translate_xyz is in the SAME coordinate units as your hull mesh.
+        rotate_about_xyz is a point for pitch rotation axis direction default (0,1,0).
+        """
+        self.foil_mesh = foil_mesh.copy()
+        self.foil_pose["translate"] = np.array(translate_xyz, dtype=float)
+        self.foil_pose["rotate_axis"] = Axis((0, 1, 0), tuple(rotate_about_xyz))
+        self.foil_pose["rotate_deg"] = float(rotate_deg)
+
+    def immerse_foil(self):
+        """
+        Apply hull trim/sink + foil own placement, then clip below water plane (z<=0).
+        """
+        if self.foil_mesh is None:
+            self.ifoil = None
+            return
+
+        rp = self.geo["Lf"] / SF
+        tau = np.deg2rad(self.state["tau"])
+        z = self.state["z"] / (SF * 2.54)
+
+        m = self.foil_mesh.copy()
+
+        # Apply hull trim around same axis as hull
+        m.rotate(axis=Axis((0, 1, 0), (rp, 0, 0)), angle=tau, inplace=True)
+        # Apply hull sink
+        m.translate([0, 0, -z], inplace=True)
+
+        # Apply foil local placement (after hull motion)
+        if abs(self.foil_pose["rotate_deg"]) > 1e-12:
+            m.rotate(axis=self.foil_pose["rotate_axis"], angle=np.deg2rad(self.foil_pose["rotate_deg"]), inplace=True)
+        m.translate(self.foil_pose["translate"], inplace=True)
+
+        fb = cpt.FloatingBody(mesh=m)
+        self.ifoil = fb.immersed_part()
+
+    def get_foil_viscous_force_vector(self, foil_chord_m=0.2, Cf_scale=1.0):
+        """
+        Viscous (friction) force vector on immersed foil.
+        foil_chord_m: characteristic length for Reynolds number.
+        """
+        if self.ifoil is None:
+            return np.zeros(3)
+
+        U = self.get_flow_velocity_vector()
+        F = self._friction_force_vector_on_mesh(self.ifoil.mesh, U, Lc=foil_chord_m, Cf_scale=Cf_scale)
+        return F  # foil mesh should already be in meters-scale IF you build it that way
+
+    # ----------------------------
+    # Waterline solving
+    # ----------------------------
+    def get_rough_waterline(self):
+        zvals = np.linspace(1, 25, 100)
+        mvals = []
+        for zi in zvals:
+            self.state["z"] = float(zi)
+            self.immerse_hull()
+            mvals.append(self.get_total_lift())
+
+        zw = float(zvals[np.abs(np.array(mvals) - self.state["m"]).argmin()])
+        self.state["z"] = zw
+        self.immerse_hull()
+
+        if self.debug:
+            print(f"Waterline {zw} cm")
+            print("Total lift-like:", self.get_total_lift(), "Target m:", self.state["m"])
+            self.ibody.show()
+
+    # ----------------------------
+    # Total resistance outputs (vector + scalar)
+    # ----------------------------
+    def get_total_resistance_vector(self, include_hull_viscous=True, include_foil_viscous=True,
+                                    hull_Lc=None, hull_Cf_scale=0.12, foil_chord_m=0.2, foil_Cf_scale=1.0):
+        """
+        Returns total water resistance FORCE VECTOR (N) from:
+        - hull viscous friction (vector sum on wetted hull surface)
+        - foil viscous friction (if attached)
+        (Your original planing model drag is scalar; not included here as a vector.)
+        """
+        # Ensure immersed meshes exist
+        if not hasattr(self, "ibody"):
+            self.immerse_hull()
+
+        self.immerse_foil()
+
+        F = np.zeros(3)
+
+        if include_hull_viscous:
+            F += self.get_hull_viscous_force_vector(Lc=hull_Lc, Cf_scale=hull_Cf_scale)
+
+        if include_foil_viscous:
+            F += self.get_foil_viscous_force_vector(foil_chord_m=foil_chord_m, Cf_scale=foil_Cf_scale)
+
+        return F
+
+    def get_total_resistance_scalar(self, **kwargs):
+        """
+        Positive scalar resistance opposing motion direction.
+        """
+        F = self.get_total_resistance_vector(**kwargs)
+        return self.resistance_along_motion(F)
+
+    # ----------------------------
+    # Your old scalar drag (kept) but sign-aware along x
+    # ----------------------------
+    def get_total_drag_scalar_oldmodel(self):
+        """
+        Old model: planing 'vl' + skin friction magnitude.
+        Returns signed x-force consistent with signed v.
+        """
+        # Planing model drag magnitude:
+        Dp = float(self.get_hydrodynamic_forces()[1])  # magnitude-ish
+
+        # Your old skin friction magnitude:
+        vmag = abs(float(self.state["v"]))
+        wet_area = self.get_wetted_areas("total")[-1]
+        wl = self.get_wetted_length()
+        Rn = vmag * wl / 1.19e-6
+        if Rn > 100:
+            Cf = 0.075 / (np.log10(Rn) - 2) ** 2
+        else:
+            Cf = 0.0
+        Cf = 0.12 * Cf
+        Dsf = 0.5 * 1025 * Cf * wet_area * vmag**2
+
+        Dmag = Dp + Dsf
+        v = float(self.state["v"])
+        if abs(v) < 1e-12:
+            return 0.0
+        # signed force in x opposing motion
+        return -np.sign(v) * Dmag
+
+
+def __main__():
+    scale_factor = 0.73
+    st_i = np.array([5, 10, 15, 20, 35, 46.6, 52, 59.35, 67.85, 76.35, 95, 124]) * scale_factor
+    st_m = st_i / SF
+
+    hull = PlaningHull(
+        file="geometry/hull.csv",
+        num_points=18,
+        stations=st_m,
+        beam=13.5 * scale_factor,
+        Lf=st_i[6],
+        La=st_i[-1] - st_i[6],
+        mass=20,
+    )
+
+    # Show hull mesh
+    hull.mesh.show()
+
+    # Set state (SIGNED v)
+    hull.state.update({
+        "tau": 6,
+        "v": 5.0,   # try -5.0 to see force direction flip
+        "m": 18
+    })
+
+    # Solve waterline then compute resistance
+    hull.get_rough_waterline()
+
+    # New: vector resistance from wetted hull surface (and foil if attached)
+    F_res = hull.get_total_resistance_vector(include_foil_viscous=False)
+    R = hull.get_total_resistance_scalar(include_foil_viscous=False)
+
+    print("Total viscous force vector (N):", F_res)
+    print("Resistance opposing motion (N):", R)
+
+    # Old scalar model drag, sign-aware along x
+    Fx_old = hull.get_total_drag_scalar_oldmodel()
+    print("Old model signed x-drag force (N):", Fx_old)
+
+
+__main__()
